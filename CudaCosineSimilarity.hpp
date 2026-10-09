@@ -1,2 +1,9 @@
+#pragma once
+
+#include <cstddef>
 #include <vector>
-double *cudaCosine(std::vector<std::vector<double> > v1, std::vector<std::vector<double> > v2);
+
+// Input rows are unit-normalized, row-major TF-IDF vectors.
+// Empty documents have all-zero rows and therefore zero similarity.
+std::vector<double> cudaCosine(const std::vector<double>& vectors,
+                               std::size_t rows, std::size_t columns);

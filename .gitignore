@@ -1,0 +1,6 @@
+/program-cpu
+/program-gpu
+/*.o
+/results/
+/Output/
+__pycache__/

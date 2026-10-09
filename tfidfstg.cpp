@@ -1,469 +1,409 @@
-#include<stdio.h>
-#include<iostream>
-#include<map>
-#include<iostream>
-#include<fstream>
-#include<algorithm>
 #include <mpi.h>
-#include<dirent.h>
-#include<string.h>
-#include<string>
-#include<cmath>
-#include<stdlib.h>
-#include<vector>
-#include<omp.h>
+#include <omp.h>
+
+#ifdef USE_CUDA
 #include "CudaCosineSimilarity.hpp"
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <climits>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
-#define WMAX 1000
-#define FMAX 3
-#define pb push_back
-#define mp make_pair
-using namespace std;
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
-//========================================================//
-struct dirent* ent;
-DIR* books;
+namespace {
+struct Options {
+    std::string input = "movies_metadata - Sheet1.csv";
+    std::string stopwords = "StopWords.txt";
+    std::string output = "results/top_matches.csv";
+    std::size_t limit = 1000;
+    std::size_t vocabulary = 256;
+    std::size_t top = 20;
+    bool verify = false;
+};
 
-typedef struct msg{
-	int start,end;
-}MSG;
-typedef struct movies{
-	string name;
-	string description;
-}mov;
-//=========================================================//
-bool myFunc(pair<string, float> a,pair<string, float>b){
-	return a.second > b.second;
+struct Movie {
+    std::string title;
+    std::string description;
+};
+
+struct Counts {
+    std::unordered_map<std::string, int> terms;
+    int total = 0;
+};
+
+struct Match {
+    std::size_t first;
+    std::size_t second;
+    double score;
+};
+
+std::size_t positiveNumber(const std::string& text, const std::string& flag) {
+    std::size_t used = 0;
+    const unsigned long long number = std::stoull(text, &used);
+    if (used != text.size() || number == 0 ||
+        number > static_cast<unsigned long long>(INT_MAX)) {
+        throw std::invalid_argument(flag + " must be a positive integer up to INT_MAX");
+    }
+    return static_cast<std::size_t>(number);
 }
-//========================================================//
-bool sortFunc(pair<int,double>a, pair<int,double>b){
-	return a.second < b.second;
-}
-//========================================================//
 
-
-
-
-
-
-
-
-
-std::vector<std::vector<double> > cudaCosineSimilarity(std::vector<std::vector<double> > v1, std::vector<std::vector<double> > v2, double *ms) {
-    std::cout << "Running CUDA Cosine Similarity" << std::endl;
-
-    std::clock_t start = std::clock();
-    double *results = cudaCosine(v1, v2);
-    std::clock_t end = std::clock();
-
-    std::vector<std::vector<double> > t_results;
-    int vector_size = v1[0].size();
-
-    std::vector<double> v1_results;
-    for(int i = 0; i < v1.size(); i++) {
-        v1_results.clear();
-        for(int j = 0; j < v2.size(); j++) {
-            v1_results.push_back(results[i*v2.size() + j]);
+Options parseOptions(int argc, char** argv) {
+    Options options;
+    for (int i = 1; i < argc; ++i) {
+        const std::string flag = argv[i];
+        if (flag == "--verify") {
+            options.verify = true;
+            continue;
         }
-        t_results.push_back(v1_results);
+        if (i + 1 == argc) throw std::invalid_argument("missing value for " + flag);
+        const std::string value = argv[++i];
+        if (flag == "--input") options.input = value;
+        else if (flag == "--stopwords") options.stopwords = value;
+        else if (flag == "--output") options.output = value;
+        else if (flag == "--limit") options.limit = positiveNumber(value, flag);
+        else if (flag == "--vocab") options.vocabulary = positiveNumber(value, flag);
+        else if (flag == "--top") options.top = positiveNumber(value, flag);
+        else throw std::invalid_argument("unknown option: " + flag);
+    }
+    return options;
+}
+
+// Parse quoted fields, doubled quotes, and embedded newlines.
+bool readCsvRecord(std::istream& input, std::vector<std::string>& fields) {
+    fields.clear();
+    std::string field;
+    bool quoted = false;
+    bool fieldStart = true;
+    bool any = false;
+    char character;
+    while (input.get(character)) {
+        any = true;
+        if (quoted) {
+            if (character == '"' && input.peek() == '"') {
+                input.get(character);
+                field += '"';
+            } else if (character == '"') {
+                quoted = false;
+            } else {
+                field += character;
+            }
+        } else if (character == '"' && fieldStart) {
+            quoted = true;
+            fieldStart = false;
+        } else if (character == ',') {
+            fields.push_back(field);
+            field.clear();
+            fieldStart = true;
+        } else if (character == '\n') {
+            if (!field.empty() && field.back() == '\r') field.pop_back();
+            fields.push_back(field);
+            return true;
+        } else {
+            field += character;
+            fieldStart = false;
+        }
+    }
+    if (quoted) throw std::runtime_error("unterminated quoted CSV field");
+    if (!any) return false;
+    if (!field.empty() && field.back() == '\r') field.pop_back();
+    fields.push_back(field);
+    return true;
+}
+
+std::vector<Movie> readMovies(const Options& options) {
+    std::ifstream input(options.input, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open input: " + options.input);
+    std::vector<Movie> movies;
+    std::vector<std::string> fields;
+    while (movies.size() < options.limit && readCsvRecord(input, fields)) {
+        if (fields.size() >= 2 && !fields[0].empty() && !fields[1].empty()) {
+            movies.push_back({fields[0], fields[1]});
+        }
+    }
+    if (movies.size() < 2) throw std::runtime_error("input needs at least two movies with descriptions");
+    return movies;
+}
+
+std::unordered_set<std::string> readStopwords(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) throw std::runtime_error("cannot open stop-word file: " + path);
+    std::unordered_set<std::string> words;
+    std::string word;
+    while (input >> word) words.insert(word);
+    return words;
+}
+
+Counts countTerms(const std::string& text,
+                  const std::unordered_set<std::string>& stopwords) {
+    Counts result;
+    std::string word;
+    auto addWord = [&]() {
+        if (!word.empty() && !stopwords.count(word)) {
+            ++result.terms[word];
+            ++result.total;
+        }
+        word.clear();
+    };
+    for (unsigned char character : text) {
+        if (character < 128 && std::isalnum(character)) {
+            word += static_cast<char>(std::tolower(character));
+        } else {
+            addWord();
+        }
+    }
+    addWord();
+    return result;
+}
+
+std::vector<Counts> gatherCounts(const std::vector<Movie>& movies,
+                                 const std::unordered_set<std::string>& stopwords,
+                                 int rank, int tasks) {
+    const std::size_t begin = movies.size() * static_cast<std::size_t>(rank) / tasks;
+    const std::size_t end = movies.size() * static_cast<std::size_t>(rank + 1) / tasks;
+    std::vector<Counts> local(end - begin);
+#pragma omp parallel for schedule(dynamic)
+    for (long long offset = 0; offset < static_cast<long long>(local.size()); ++offset) {
+        local[static_cast<std::size_t>(offset)] =
+            countTerms(movies[begin + static_cast<std::size_t>(offset)].description, stopwords);
     }
 
-    *ms = (end - start) / (double) (CLOCKS_PER_SEC / 1000);
+    std::ostringstream serialized;
+    for (std::size_t offset = 0; offset < local.size(); ++offset) {
+        const std::size_t id = begin + offset;
+        serialized << "D " << id << ' ' << local[offset].total << '\n';
+        for (const auto& term : local[offset].terms) {
+            serialized << "T " << id << ' ' << term.first << ' ' << term.second << '\n';
+        }
+    }
+    const std::string payload = serialized.str();
+    if (payload.size() > static_cast<std::size_t>(INT_MAX)) {
+        throw std::runtime_error("worker payload exceeds MPI int count range");
+    }
+    const int sendSize = static_cast<int>(payload.size());
+    std::vector<int> sizes(rank == 0 ? tasks : 0);
+    MPI_Gather(&sendSize, 1, MPI_INT, rank == 0 ? sizes.data() : nullptr,
+               1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    return t_results;
+    std::vector<int> offsets(rank == 0 ? tasks : 0);
+    std::vector<char> gathered;
+    if (rank == 0) {
+        long long total = 0;
+        for (int task = 0; task < tasks; ++task) {
+            offsets[task] = static_cast<int>(total);
+            total += sizes[task];
+            if (total > INT_MAX) throw std::runtime_error("gather exceeds MPI int count range");
+        }
+        gathered.resize(static_cast<std::size_t>(total));
+    }
+    MPI_Gatherv(payload.data(), sendSize, MPI_CHAR,
+                rank == 0 ? gathered.data() : nullptr,
+                rank == 0 ? sizes.data() : nullptr,
+                rank == 0 ? offsets.data() : nullptr,
+                MPI_CHAR, 0, MPI_COMM_WORLD);
+    if (rank != 0) return {};
 
+    std::vector<Counts> counts(movies.size());
+    std::vector<bool> seen(movies.size(), false);
+    std::istringstream input(std::string(gathered.begin(), gathered.end()));
+    char type;
+    std::size_t id;
+    while (input >> type >> id) {
+        if (id >= movies.size()) throw std::runtime_error("invalid gathered document ID");
+        if (type == 'D') {
+            input >> counts[id].total;
+            seen[id] = true;
+        } else if (type == 'T') {
+            std::string word;
+            int occurrences;
+            input >> word >> occurrences;
+            counts[id].terms[word] = occurrences;
+        } else {
+            throw std::runtime_error("invalid gathered record");
+        }
+        if (!input) throw std::runtime_error("truncated gathered record");
+    }
+    if (std::find(seen.begin(), seen.end(), false) != seen.end()) {
+        throw std::runtime_error("missing gathered document");
+    }
+    return counts;
 }
 
-
-
-
-int main(int argc , char *argv[]){
-	double startT, endT;
-	const int MASTER  =  0;
-	int numTasks,rank,count=0,datawait,rc;
-	
-	int totalrec;
-//	cout<<"Enter Records: ";
-//	cin>>totalrec;
-//	cout<<endl;
-
-	fstream fptr;
-	fptr.open("movies_metadata - Sheet1.csv", ios::in);
-	vector<mov> movs; 
-	int itera=0;
-	while(!fptr.eof() && itera<1001){
-		mov m12;
-		    
-        getline(fptr, m12.name ,',');
-        getline(fptr, m12.description ,'\n');
-	movs.push_back(m12);
-	
-	count++;
-	//cout<<"\n name: "<<movs[itera].name<<" || description: "<<movs[itera].description<<endl;
-	itera++;
-	}
-	fptr.close();	
-
-	//cout<<"\n\n\n\n\nname: "<<movs[14].name<<end<<endl;
-	
-	
-	
-	
-	MPI_Status Stat;
-	MPI_Request req;
-	MPI_Init(&argc,&argv);
-	MPI_Comm_size(MPI_COMM_WORLD,&numTasks);
-	MPI_Comm_rank(MPI_COMM_WORLD,&rank);	
-	omp_set_num_threads(4);
-	/* create a custom datatype */
-	const int nitems=2;
-	map<string,float>IDF;
-	map<string,float>IDF2;
-	map<string,float>::iterator it;
-	int blocklengths[2] = {1,1};
-	MPI_Datatype types[2] = {MPI_INT, MPI_INT};
-	MPI_Datatype mpi_msg_type;
-	MPI_Aint     offsets[2];
-
-	offsets[0] = offsetof(MSG, start);
-	offsets[1] = offsetof(MSG, end);
-
-	MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_msg_type);
-	MPI_Type_commit(&mpi_msg_type);
-	
-	/* MASTER CODE */
-	MSG outMsg;
-	MSG inMsg;
-
-		//count=movs.size();
-
-	if(rank == MASTER){
-		startT = omp_get_wtime();
-		
-		if(numTasks > count){
-			printf("More Number of processes then files in corpus\n");
-			exit(0);
-		}
-
-		int range = (int)floor(count / (float)(count,numTasks-1));
-		printf("\n\n\n\n\nRange: %d\n\n\n\n",range);
-		int s = 1,e;
-		/* send out Messages to the slaves */
-		for(int i = 1 ; i< numTasks ; i++){
-			e = s + range - 1-1;
-			outMsg.start = s-1;
-			outMsg.end = e;
-			if(i == numTasks - 1)
-				outMsg.end = max(e,count-1);
-			s = s+range;
-			rc = MPI_Send(&outMsg, 1, mpi_msg_type, i, 1, MPI_COMM_WORLD);
-	      	rc = MPI_Send(&count, 1, mpi_msg_type, i, 2, MPI_COMM_WORLD);	
-				  printf("Task %d: Sent message %d %dto task %d with tag 1\n",rank, outMsg.start, outMsg.end, i);
-		}
-		
-		// wait for completion message from all idfs. // 
-		for(int i = 1 ;  i< numTasks ; i++){
-			rc = MPI_Recv(&inMsg, 1, mpi_msg_type, i, 1, MPI_COMM_WORLD, &Stat);
-		}
-		//printf("IDF re\n");
-		
-		// compute Global IDF //
-		IDF.clear();
-		
-		float val;
-		int cnt;
-		char fname[80],temp[8],token[800];
-		int flag = 0;
-		#pragma omp parallel for private(fname,token,val,cnt)
-		for(int i= 1 ; i< numTasks ; i++){
-			char fname[80],temp[8],token[800];
-			sprintf(fname,"Output/IDF/idf%d.txt",i);
-			FILE* fp = fopen(fname,"r");
-			int cnt;
-			while(fscanf(fp,"%s%s%d",token,temp,&cnt) != EOF ){
-				string str(token);
-				
-				//#pragma omp critical  
-				 if(IDF.find(str) == IDF.end()){
-					#pragma omp critical
-					IDF.insert(mp(str,cnt));
-				 }
-				 else{
-					#pragma omp critical
-					IDF[str] += val;
-				 }
-				
-				
-			}	
-		}
-		cout<<"\nidf read successfully\n";
-		ofstream idout;
-		idout.open("Output/IDF/Corpus_Idf.txt");
-		for(it = IDF.begin() ; it != IDF.end() ; it++){
-			it -> second = log((count) / it->second);
-			
-			idout << it -> first << " -> " << it -> second<<endl;
-			IDF2.insert(mp(it->first, it->second));
-		}
-		IDF.clear();
-		cout<<"\n corpus idf written successfully\n";
-
-
-		
-		vector<vector<double>> vq;
-		float cn12;
-		vector<float> tfidf_vectors[count];
-		//vector<float> temp_vec(20);
-		
-		//map<string,float> tfsets[count];
-	//	#pragma omp parallel for private(fname,token,val,cn12)
-		for(int i= 0 ; i< count ; i++){
-			int cnt;
-			char fname[80],temp[8],token[800];
-			//cout<<endl;
-			sprintf(fname,"Output/TF/tf%d.txt",i);
-			FILE* fp = fopen(fname,"r");
-			//cout<<endl<<endl<<i<<endl<<endl;
-			//string word,temp;
-			float cn123;
-			vector<float> temp_vec(20,0);
-			
-			 int checkdigi=0;
-			 while(fscanf(fp,"%s%f",token,&cn12)!=EOF&&checkdigi<20) {
-				
-				string str(token);
-					
-				//tfsets[i].insert(mp(str,cnt));
-				if(IDF2.find(str)!=IDF2.end()){
-			//	cout <<"tfid value of "<<str<<" is: "<<IDF2[str]*cn12<<"       ";
-				
-				float valflot=IDF2[str]*cn12;
-				//tfidf_vectors[i].push_back(valflot);
-				if(checkdigi<20){
-				temp_vec[checkdigi]=valflot;
-				}
-				else{
-				//temp_vec.push_back(valflot);
-				}
-				}
-
-				checkdigi++;
-
-			 }
-			vector<double> temp_vec2(temp_vec.begin(),temp_vec.end());
-			vq.push_back(temp_vec2);	
-			//cout<<endl;
-			temp_vec.clear();
-		}
-		cout<<"\n tfidf calculated successfully\n";
-		
-		// for(int i=0;i<count;i++){
-		// 	vq.push_back(tfidf_vectors[i]);
-				
-		// }
-		endT = omp_get_wtime();
-		printf("Timetaken for TFIDF Calculation: %lf\n",endT-startT);
-
-		// for(int i = 1 ;  i< numTasks ; i++){
-		// 	rc = MPI_Send(&outMsg, 1, mpi_msg_type, i, 1, MPI_COMM_WORLD);
-		// }
-		// printf("sent\n");
-		// // wait for completion message from all processes. // 
-		// for(int i = 1 ;  i< numTasks ; i++){
-		// 	rc = MPI_Recv(&inMsg, 1, mpi_msg_type, i, 1, MPI_COMM_WORLD, &Stat);
-		// }
-
-		double cudasec;
-		vector<vector<double>> results=cudaCosineSimilarity(vq,vq,&cudasec);
-		for(int i =0;i<count;i++){
-			for(int j=0;j<results[i].size();j++){
-			//	cout<<" "<<results[i][j]<<" ";
-			}
-			//cout<<endl;
-		}
-
-
-
-
-
-
-
-
-
-
-
-
-		
-			
-	}
-	else{
-		double t1,t2;
-		t1 = omp_get_wtime();
-		map<string, float>TF;
-		int count;
-		map<string, float>IDF;
-		map<string, float>::iterator it;
-		map<string, float>::iterator itF;
-		IDF.clear();
-		int cflag = 0;
-		float val;
-		string StopWords[400];
-		char fname[80],token[800],outFile[80],temp[30];
-		memset(fname,'\0',sizeof(fname));
-		memset(outFile,'\0',sizeof(outFile));
-		/* Read Stop Words From File */
-		ifstream stop("StopWords.txt");
-		int k = 0;
-		while(getline(stop, StopWords[k])){
-			k++;
-		}
-		
-		
-		rc = MPI_Recv(&inMsg, 1, mpi_msg_type, MASTER, 1, MPI_COMM_WORLD, &Stat);
-		rc= MPI_Recv(&count, 1, mpi_msg_type, MASTER, 2, MPI_COMM_WORLD, &Stat);
-		printf("Task %d: Received %d char(s) (%d %d) from task %d with tag %d \n",
-		rank, count, inMsg.start, inMsg.end,Stat.MPI_SOURCE, Stat.MPI_TAG);
-		int idfflag = 0;
-	//	map<string, int>tfset[inMsg.end-inMsg.start+1];
-	//	int totalsetssthg=inMsg.end- inMsg.start+1;
-		int mycont=0;
-		#pragma omp parallel for private(fname,outFile,TF,token,it,idfflag) shared(StopWords)
-		for(int i = inMsg.start ; i<= inMsg.end; i++){
-			idfflag = 0;
-			memset(fname,'\0', sizeof(fname));
-			memset(outFile,'\0', sizeof(outFile));
-			TF.clear();
-			
-		//	sprintf(fname,"BOOKS/%d.txt",i);
-			sprintf(outFile,"Output/TF/tf%d.txt",i);
-			// FILE* fp = fopen(fname,"r");
-			ofstream out;
-			out.open(outFile);
-			// if(fp == NULL){
-			// 	printf("Directory not open\n");
-			// 	exit(0);
-			// }
-			istringstream isis(movs[i].description);
-			int mergeFlag = 0;
-			string final_token;
-			char sp[2] = {' ','\0'};
-			int totwo=0;
-			while(isis>>token){
-			totwo++;				
-				string tok(token);
-				tok.erase(remove(tok.begin(), tok.end(), '#'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), ' '), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '>'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '|'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '='), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '+'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '_'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), ','), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '-'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '*'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), ';'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '"'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '.'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '!'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), ')'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '('), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), ']'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '['), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '&'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '$'), tok.end());
-				tok.erase(remove(tok.begin(), tok.end(), '?'), tok.end());
-				//transform(tok.begin(), tok.end(), tok.begin(), ::tolower);
-				
-				int tokFlag= 0;
-				string tt = tok;
-				transform(tt.begin(), tt.end(), tt.begin(), ::tolower);
-				for(int k = 0 ; k < 400 ; k++){
-					if(tt.compare(StopWords[k]) == 0){
-						tokFlag = 1;
-						break;
-					}
-				}
-				if(tokFlag == 1){
-					continue;
-				}
-				
-				if(tok[0]>= 65 && tok[0] <= 90 && mergeFlag == 0){
-					final_token.clear();
-					final_token = tok;
-					mergeFlag = 1;
-					continue;
-				}
-				else if(tok[0]>= 65 && tok[0] <= 90 && mergeFlag == 1 && final_token.size() < 100){
-					final_token = final_token + "_" +tok;
-					continue;
-				}
-				else if((tok[0]<65 || tok[0] >90) && mergeFlag == 1){
-					tok.clear();
-					tok = final_token;
-					final_token.clear();
-					mergeFlag = 0;
-				}
-				
-				if((int)tok[0] == 39 || ((int)tok[0]>=48 && (int)tok[0]<=57)|| tok.size() == 0)
-					continue;
-				if(TF.find(tok) == TF.end()){
-					TF.insert(pair<string, float>(tok,1));
-				//tfset[mycont].insert(pair<string, int>(tok,1));
-				}
-				else{
-					TF[tok] +=1;
-					//tfset[mycont][tok]+=1;
-				}
-			
-			}
-			//out<<movs[i].name<<endl;
-			for(it = TF.begin() ; it!= TF.end() ; it++){
-
-				out << it->first<<" "<<( it->second/totwo) << endl;
-				if(IDF.find(it->first) == IDF.end()){
-					#pragma omp critical
-					IDF.insert(pair<string , float>(it->first, 1));
-				}
-				else{
-					#pragma omp critical
-					IDF[it ->first] +=1;
-				} 
-
-			}
-			//tfset[mycont]=TF;
-			out.close();
-			//fclose(fp);
-			mycont++;
-			
-		}
-		cout<<"\nTF calculate by process: "<<rank<<endl;
-		ofstream out_idf;
-		sprintf(fname,"Output/IDF/idf%d.txt",rank);
-		out_idf.open(fname);
-		for(itF = IDF.begin() ; itF!= IDF.end() ; itF++){
-			//itF -> second = log10((inMsg.end - inMsg.start + 1)/itF->second);
-			out_idf << itF->first << " -> "<< itF->second << endl; 
-		}
-		IDF.clear();
-		out_idf.close();
-		MSG inM;
-		rc = MPI_Send(&inM, 1, mpi_msg_type, MASTER, 1, MPI_COMM_WORLD);
-		printf("Local Idf Completed Message sent to Master\n");
-		//rc = MPI_Recv(&inM, 1, mpi_msg_type, MASTER, 1, MPI_COMM_WORLD, &Stat);
-
-
-
-
-
-		// completion Message
-		t2 = omp_get_wtime();
-		//rc = MPI_Send(&outMsg, 1, mpi_msg_type, MASTER, 1, MPI_COMM_WORLD);
-		printf("Time Taken by Process %d is %lf\n",rank,t2-t1);
-	}
-	MPI_Finalize();
-	
-
-
-return 0;	
+std::vector<double> makeVectors(const std::vector<Counts>& counts,
+                                std::size_t requestedVocabulary, std::size_t& dimensions) {
+    std::unordered_map<std::string, int> documentFrequency;
+    for (const Counts& doc : counts) {
+        for (const auto& term : doc.terms) ++documentFrequency[term.first];
+    }
+    std::vector<std::pair<std::string, int>> vocabulary(documentFrequency.begin(),
+                                                        documentFrequency.end());
+    std::sort(vocabulary.begin(), vocabulary.end(), [](const auto& a, const auto& b) {
+        return a.second != b.second ? a.second > b.second : a.first < b.first;
+    });
+    dimensions = std::min(requestedVocabulary, vocabulary.size());
+    if (dimensions == 0) throw std::runtime_error("no terms remain after stop-word filtering");
+    vocabulary.resize(dimensions);
+    std::unordered_map<std::string, std::size_t> indices;
+    for (std::size_t column = 0; column < dimensions; ++column) {
+        indices[vocabulary[column].first] = column;
+    }
+    std::vector<double> vectors(counts.size() * dimensions, 0.0);
+    for (std::size_t row = 0; row < counts.size(); ++row) {
+        if (counts[row].total == 0) continue;
+        double normSquared = 0.0;
+        for (const auto& term : counts[row].terms) {
+            const auto column = indices.find(term.first);
+            if (column == indices.end()) continue;
+            const double tf = static_cast<double>(term.second) / counts[row].total;
+            const double idf = std::log((1.0 + counts.size()) /
+                                         (1.0 + documentFrequency.at(term.first))) + 1.0;
+            const double weight = tf * idf;
+            vectors[row * dimensions + column->second] = weight;
+            normSquared += weight * weight;
+        }
+        if (normSquared > 0.0) {
+            const double norm = std::sqrt(normSquared);
+            for (std::size_t column = 0; column < dimensions; ++column) {
+                vectors[row * dimensions + column] /= norm;
+            }
+        }
+    }
+    return vectors;
 }
-	
+
+double cpuDot(const std::vector<double>& vectors, std::size_t dimensions,
+              std::size_t first, std::size_t second) {
+    double dot = 0.0;
+    for (std::size_t column = 0; column < dimensions; ++column) {
+        dot += vectors[first * dimensions + column] * vectors[second * dimensions + column];
+    }
+    return dot;
+}
+
+std::vector<double> cpuCosine(const std::vector<double>& vectors,
+                              std::size_t rows, std::size_t dimensions) {
+    std::vector<double> similarity(rows * rows, 0.0);
+#pragma omp parallel for schedule(dynamic)
+    for (long long row = 0; row < static_cast<long long>(rows); ++row) {
+        for (std::size_t column = 0; column < rows; ++column) {
+            similarity[static_cast<std::size_t>(row) * rows + column] =
+                cpuDot(vectors, dimensions, static_cast<std::size_t>(row), column);
+        }
+    }
+    return similarity;
+}
+
+void verifyResults(const std::vector<double>& vectors, std::size_t rows,
+                   std::size_t dimensions, const std::vector<double>& similarity) {
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t column = 0; column < rows; ++column) {
+            const double score = similarity[row * rows + column];
+            if (!std::isfinite(score) || score < -1e-9 || score > 1.0 + 1e-9 ||
+                std::abs(score - similarity[column * rows + row]) > 1e-9) {
+                throw std::runtime_error("similarity is non-finite, out of range, or asymmetric");
+            }
+        }
+    }
+    const std::size_t sample = std::min<std::size_t>(rows, 32);
+    for (std::size_t row = 0; row < sample; ++row) {
+        for (std::size_t column = 0; column < sample; ++column) {
+            const double expected = cpuDot(vectors, dimensions, row, column);
+            if (!std::isfinite(similarity[row * rows + column]) ||
+                std::abs(expected - similarity[row * rows + column]) > 1e-9) {
+                throw std::runtime_error("similarity failed CPU reference check");
+            }
+        }
+    }
+}
+
+std::string csvField(const std::string& value) {
+    std::string result = "\"";
+    for (char character : value) {
+        if (character == '"') result += '"';
+        result += character;
+    }
+    return result + '"';
+}
+
+void writeMatches(const Options& options, const std::vector<Movie>& movies,
+                  const std::vector<double>& similarity) {
+    std::vector<Match> matches;
+    for (std::size_t row = 0; row < movies.size(); ++row) {
+        for (std::size_t column = row + 1; column < movies.size(); ++column) {
+            matches.push_back({row, column, similarity[row * movies.size() + column]});
+        }
+    }
+    std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+    });
+    const std::filesystem::path path(options.output);
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path);
+    if (!output) throw std::runtime_error("cannot write output: " + options.output);
+    output << "movie_a,movie_b,cosine_similarity\n" << std::setprecision(12);
+    for (std::size_t index = 0; index < std::min(options.top, matches.size()); ++index) {
+        const Match& match = matches[index];
+        output << csvField(movies[match.first].title) << ','
+               << csvField(movies[match.second].title) << ',' << match.score << '\n';
+    }
+    if (!output) throw std::runtime_error("failed writing output: " + options.output);
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank = 0;
+    int tasks = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &tasks);
+    try {
+        const Options options = parseOptions(argc, argv);
+        const double start = MPI_Wtime();
+        const auto movies = readMovies(options);
+        const auto stopwords = readStopwords(options.stopwords);
+        const auto counts = gatherCounts(movies, stopwords, rank, tasks);
+        if (rank == 0) {
+            std::size_t dimensions = 0;
+            const auto vectors = makeVectors(counts, options.vocabulary, dimensions);
+            const double preprocessingSeconds = MPI_Wtime() - start;
+            const double similarityStart = MPI_Wtime();
+#ifdef USE_CUDA
+            const auto similarity = cudaCosine(vectors, movies.size(), dimensions);
+            const char* backend = "CUDA";
+#else
+            const auto similarity = cpuCosine(vectors, movies.size(), dimensions);
+            const char* backend = "CPU";
+#endif
+            if (options.verify) verifyResults(vectors, movies.size(), dimensions, similarity);
+            const double similaritySeconds = MPI_Wtime() - similarityStart;
+            writeMatches(options, movies, similarity);
+            std::cout << "Movies: " << movies.size() << ", MPI ranks: " << tasks
+                      << ", OpenMP threads: " << omp_get_max_threads()
+                      << ", vocabulary: " << dimensions << ", backend: " << backend << '\n'
+                      << "Preprocessing: " << preprocessingSeconds << " s, similarity: "
+                      << similaritySeconds << " s\n"
+                      << "Wrote " << options.output << '\n';
+            if (options.verify) std::cout << "CPU reference check passed\n";
+        }
+        MPI_Finalize();
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "Rank " << rank << ": " << error.what() << '\n';
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    }
+}
